@@ -16,6 +16,20 @@ enum Quiz {
 
     private static let letterPattern = try! NSRegularExpression(pattern: "(?<![A-Za-z])[ABCD](?![A-Za-z])")
 
+    private static let optionMarker = try! NSRegularExpression(pattern: "(?<![A-Za-z0-9])([ABCD])\\s?[.):]")
+    private static let minOptionMarkers = 2
+
+    /// Cheap pre-check before spending ~10s of model time: at least two distinct option
+    /// markers like "A." / "B)" must appear. ponytail: quizzes whose options carry no letters
+    /// get an instant "?"; loosen this check if such a source turns up.
+    static func looksLikeQuestion(_ text: String) -> Bool {
+        let range = NSRange(text.startIndex..., in: text)
+        let letters = Set(optionMarker.matches(in: text, range: range).compactMap {
+            Range($0.range(at: 1), in: text).map { text[$0] }
+        })
+        return letters.count >= minOptionMarkers
+    }
+
     /// Final answer letter from a model reply; "?" when no A–D can be found.
     static func parseAnswer(_ reply: String) -> String {
         // Some models inline their reasoning; only the text after </think> is the answer.

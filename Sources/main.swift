@@ -7,7 +7,6 @@ import Vision
 enum Config {
     static let regionKey = "captureRegion"
     static let launchBadgeSeconds = 3.0
-    static let slotWidth: CGFloat = 22 // invisible but clickable slot when idle
     static let ollamaURL = URL(string: "http://127.0.0.1:11434")!
     static let requestTimeout: TimeInterval = 180
     static let ollamaBootSeconds = 15
@@ -15,6 +14,10 @@ enum Config {
                               "/Applications/Ollama.app/Contents/Resources/ollama"]
     static let thinking = "…"
     static let failed = "!"
+    // Top-left screen corner: rest the mouse there this long to re-select the region.
+    static let cornerDwellSeconds = 2.0
+    static let cornerPollInterval: TimeInterval = 0.25
+    static let cornerSize: CGFloat = 4
 }
 
 let log = Logger(subsystem: "local.onthi", category: "app")
@@ -134,24 +137,68 @@ final class SelectionView: NSView {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let item = NSStatusBar.system.statusItem(withLength: Config.slotWidth)
-    private let label = AnswerLabel()
+    private let menu = NSMenu()
+    private lazy var label = AnswerLabel(menu: menu) { [weak self] in self?.ask() }
     private var job: Task<Void, Never>?
     private var clearWork: DispatchWorkItem?
     private var ollamaProcess: Process?
     private var overlay: NSWindow?
+    private var cornerTimer: Timer?
+    private var cornerEnteredAt: Date?
+    private var cornerFired = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        item.button?.font = .monospacedSystemFont(ofSize: 14, weight: .bold)
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Chọn lại vùng", action: #selector(selectRegion), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Thoát", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        menu.items.first?.target = self
-        item.menu = menu
+        // Opened by clicking the corner label (the menu bar item was hidden by the notch, so it is gone).
+        let reselect = NSMenuItem(title: "Chọn lại vùng", action: #selector(selectRegion), keyEquivalent: "")
+        reselect.target = self
+        let quit = NSMenuItem(title: "Thoát", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        quit.target = NSApp
+        menu.items = [reselect, quit]
         registerHotKey()
         startOllamaIfNeeded()
-        show("✓", autoHide: true) // brief launch confirmation, since the slot is blank when idle
+        // Without the grant captures come back as bare wallpaper, so say so up front.
+        if CGPreflightScreenCaptureAccess() {
+            show("✓", autoHide: true) // brief launch confirmation, then the idle dot
+        } else {
+            CGRequestScreenCaptureAccess()
+            show(Config.failed)
+        }
         if savedRegion() == nil { selectRegion() }
+        startCornerWatch()
+    }
+
+    /// Double-clicking the app icon while it runs re-selects the region (no keyboard needed).
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        show("")
+        selectRegion()
+        return false
+    }
+
+    // Polling the mouse position needs no permission and no window that could block clicks.
+    private func startCornerWatch() {
+        cornerTimer = Timer.scheduledTimer(withTimeInterval: Config.cornerPollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkCorner() }
+        }
+    }
+
+    /// Mouse resting in the top-left corner for 2s → re-select region, once per visit.
+    private func checkCorner() {
+        guard let screen = NSScreen.screens.first else { return }
+        let mouse = NSEvent.mouseLocation
+        let isInCorner = mouse.x <= screen.frame.minX + Config.cornerSize
+            && mouse.y >= screen.frame.maxY - Config.cornerSize
+        guard isInCorner else {
+            cornerEnteredAt = nil
+            cornerFired = false
+            return
+        }
+        guard !cornerFired else { return }
+        let enteredAt = cornerEnteredAt ?? Date()
+        cornerEnteredAt = enteredAt
+        guard Date().timeIntervalSince(enteredAt) >= Config.cornerDwellSeconds else { return }
+        cornerFired = true
+        show("")
+        selectRegion()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -216,9 +263,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Triggered by resting the mouse on the corner dot, or ⌃⌥A. One capture per ask.
     private func ask() {
+        guard overlay == nil else { return }
         guard let region = savedRegion() else { selectRegion(); return }
-        job?.cancel() // new press wins over an answer still being computed
+        job?.cancel() // newest ask wins over an answer still being computed
         clearWork?.cancel()
         setTitle(Config.thinking)
         job = Task {
@@ -227,10 +276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let image = try await SCScreenshotManager.captureImage(in: region)
                 let text = try recognizeText(image)
                 saveLastCapture(image, text: text)
-                answer = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? Quiz.unsure : try await askModel(text)
+                // Not a quiz on screen: say "?" now instead of spending model time on it.
+                answer = Quiz.looksLikeQuestion(text) ? try await askModel(text) : Quiz.unsure
             } catch {
-                log.error("ask failed: \(error)")
+                log.error("answer failed: \(error)")
                 answer = Config.failed
             }
             if Task.isCancelled { return }
@@ -238,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Answers stay until the next hotkey press; only the launch ✓ hides itself.
+    /// Answers stay until the next ask; only the launch ✓ hides itself.
     private func show(_ text: String, autoHide: Bool = false) {
         clearWork?.cancel()
         setTitle(text)
@@ -249,7 +298,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setTitle(_ text: String) {
-        item.button?.title = text
         label.show(text)
     }
 
