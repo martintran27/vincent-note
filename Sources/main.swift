@@ -14,6 +14,7 @@ enum Config {
                               "/Applications/Ollama.app/Contents/Resources/ollama"]
     static let thinking = "…"
     static let failed = "!"
+    static let picking = "+" // corner label while the invisible region picker is open
     // Top-left screen corner: rest the mouse there this long to re-select the region.
     static let cornerDwellSeconds = 2.0
     static let cornerPollInterval: TimeInterval = 0.25
@@ -67,7 +68,8 @@ func waitForOllama() async throws {
     throw OllamaError(detail: "Ollama not reachable at \(Config.ollamaURL)")
 }
 
-func askModel(_ question: String) async throws -> String {
+/// Raw model reply; callers parse it for their mode (letter or essay).
+func askModel(system: String, question: String) async throws -> String {
     try await waitForOllama()
     var request = URLRequest(url: Config.ollamaURL.appendingPathComponent("api/chat"))
     request.httpMethod = "POST"
@@ -75,7 +77,7 @@ func askModel(_ question: String) async throws -> String {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     let body: [String: Any] = [
         "model": Quiz.model, "stream": false, "think": true, "keep_alive": Quiz.keepAlive,
-        "messages": [["role": "system", "content": Quiz.systemPrompt],
+        "messages": [["role": "system", "content": system],
                      ["role": "user", "content": question]],
     ]
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -86,16 +88,19 @@ func askModel(_ question: String) async throws -> String {
     struct Reply: Decodable { struct Message: Decodable { let content: String }; let message: Message }
     let content = try JSONDecoder().decode(Reply.self, from: data).message.content
     log.info("model reply: \(content, privacy: .public)")
-    return Quiz.parseAnswer(content)
+    return content
 }
 
 // MARK: - Region selection overlay
 
-final class OverlayWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
+/// Non-activating and never key: the region picker must not take focus from the quiz window.
+final class OverlayWindow: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
-/// Nothing visible by request: no dimming, no outlines — just the crosshair cursor while dragging.
+/// Nothing visible by request: no dimming, no outlines. The corner label shows "+" meanwhile
+/// (the app never takes focus, so it cannot change the cursor).
 final class SelectionView: NSView {
     // Near-zero alpha: fully transparent pixels would let clicks fall through to the app below.
     private static let catchAllFill = NSColor.black.withAlphaComponent(0.003)
@@ -110,8 +115,7 @@ final class SelectionView: NSView {
     }
     required init?(coder: NSCoder) { nil }
 
-    override var acceptsFirstResponder: Bool { true }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) { start = convert(event.locationInWindow, from: nil) }
     override func mouseDragged(with event: NSEvent) {
@@ -123,9 +127,6 @@ final class SelectionView: NSView {
     override func mouseUp(with event: NSEvent) {
         onDone(selection.width > 10 && selection.height > 10 ? selection : nil)
     }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == UInt16(kVK_Escape) { onDone(nil) }
-    }
     override func draw(_ dirtyRect: NSRect) {
         Self.catchAllFill.setFill() // invisible; only the crosshair cursor shows
         bounds.fill()
@@ -136,8 +137,16 @@ final class SelectionView: NSView {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let menu = NSMenu()
-    private lazy var label = AnswerLabel(menu: menu) { [weak self] in self?.ask() }
+    private lazy var label = AnswerLabel { [weak self] in self?.ask() } // fixed trigger dot
+    /// The answer, separate from the dot and draggable; by default just left of the dot.
+    private lazy var answerLine = AnswerLine(
+        defaultAnchor: NSPoint(x: label.frame.minX - 4, y: label.frame.midY),
+        onScroll: { [weak self] in self?.moveStep(by: $0) },
+        onMoved: { [weak self] in Task { await self?.refreshInk() } })
+    private var isBackgroundDark = false
+    private var ink: Ink { Ink(isBackgroundDark: isBackgroundDark) }
+    private var steps: [String] = []
+    private var stepIndex = 0
     private var job: Task<Void, Never>?
     private var clearWork: DispatchWorkItem?
     private var ollamaProcess: Process?
@@ -147,17 +156,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cornerFired = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Opened by clicking the corner label (the menu bar item was hidden by the notch, so it is gone).
-        let reselect = NSMenuItem(title: "Chọn lại vùng", action: #selector(selectRegion), keyEquivalent: "")
-        reselect.target = self
-        let quit = NSMenuItem(title: "Thoát", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
-        quit.target = NSApp
-        menu.items = [reselect, quit]
+        // No menu by request (a pop-up menu is the one thing that could take focus).
+        // Re-select: rest in the top-left corner or double-click the app icon. Quit: ⌃⌥Q or Activity Monitor.
+        applyInk()
         registerHotKey()
         startOllamaIfNeeded()
         // Without the grant captures come back as bare wallpaper, so say so up front.
         if CGPreflightScreenCaptureAccess() {
             show("✓", autoHide: true) // brief launch confirmation, then the idle dot
+            Task { await refreshInk() }
         } else {
             CGRequestScreenCaptureAccess()
             show(Config.failed)
@@ -168,13 +175,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Double-clicking the app icon while it runs re-selects the region (no keyboard needed).
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        show("")
         selectRegion()
         return false
     }
 
     // Polling the mouse position needs no permission and no window that could block clicks.
     private func startCornerWatch() {
+        // ponytail: App Nap may stretch this to a few seconds in the background; the user is fine with that.
         cornerTimer = Timer.scheduledTimer(withTimeInterval: Config.cornerPollInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.checkCorner() }
         }
@@ -196,7 +203,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cornerEnteredAt = enteredAt
         guard Date().timeIntervalSince(enteredAt) >= Config.cornerDwellSeconds else { return }
         cornerFired = true
-        show("")
         selectRegion()
     }
 
@@ -205,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // Carbon hotkeys work globally without Accessibility permission.
-    // ⌃⌥A ask, ⌃⌥R re-select region, ⌃⌥Q quit (the menu itself may be hidden by the notch).
+    // ⌃⌥A ask, ⌃⌥R re-select region, ⌃⌥Q quit (keyboard fallback; the app has no menu).
     private func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
@@ -231,9 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hotKeyPressed(_ id: UInt32) {
         switch id {
         case 1: ask()
-        case 2:
-            show("")
-            selectRegion()
+        case 2: selectRegion()
         case 3: NSApp.terminate(nil)
         default: break
         }
@@ -268,22 +272,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let region = savedRegion() else { selectRegion(); return }
         job?.cancel() // newest ask wins over an answer still being computed
         clearWork?.cancel()
+        steps = [] // the previous answer goes away only when a new question is asked
         setTitle(Config.thinking)
         job = Task {
             var answer: String
+            var essay: String?
             do {
                 let image = try await SCScreenshotManager.captureImage(in: region)
                 let text = try recognizeText(image)
                 saveLastCapture(image, text: text)
-                // Not a quiz on screen: say "?" now instead of spending model time on it.
-                answer = Quiz.looksLikeQuestion(text) ? try await askModel(text) : Quiz.unsure
+                if Quiz.looksLikeQuestion(text) { // A–D options on screen: one letter
+                    answer = Quiz.parseAnswer(try await askModel(system: Quiz.systemPrompt, question: text))
+                } else if Quiz.hasEnoughText(text) { // anything else readable: solve it as tự luận
+                    essay = Quiz.cleanEssay(try await askModel(system: Quiz.essaySystemPrompt, question: text))
+                    answer = Quiz.unsure // shown only when the model gave no solution
+                } else {
+                    answer = Quiz.unsure
+                }
             } catch {
                 log.error("answer failed: \(error)")
                 answer = Config.failed
             }
             if Task.isCancelled { return }
-            show(answer)
+            await refreshInk() // the page under the answer may have changed since the last one
+            if Task.isCancelled { return }
+            if let essay {
+                steps = Quiz.compactSteps(essay)
+                stepIndex = 0
+                showStep()
+            } else {
+                show(answer)
+            }
         }
+    }
+
+    private func moveStep(by delta: Int) {
+        guard !steps.isEmpty else { return }
+        stepIndex = min(max(stepIndex + delta, 0), steps.count - 1)
+        showStep()
+    }
+
+    private func showStep() {
+        guard steps.indices.contains(stepIndex) else { return }
+        answerLine.show("\(steps[stepIndex])   \(stepIndex + 1)/\(steps.count)", color: ink.text)
+    }
+
+    /// Light or dark gray depending on what is behind the answer right now.
+    private func refreshInk() async {
+        guard let brightness = await backgroundBrightness(under: answerLine.area) else { return }
+        isBackgroundDark = brightness < 0.5
+        applyInk()
+    }
+
+    private var answerText = ""
+
+    private func applyInk() {
+        label.setColors(text: ink.text, idle: ink.idle)
+        if !steps.isEmpty { showStep() } else { setTitle(answerText) }
     }
 
     /// Answers stay until the next ask; only the launch ✓ hides itself.
@@ -296,8 +341,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Config.launchBadgeSeconds, execute: work)
     }
 
+    /// Status and answers go to the movable answer line; empty text hides it. The dot stays a dot.
     private func setTitle(_ text: String) {
-        label.show(text)
+        answerText = text
+        if text.isEmpty { answerLine.hide() } else { answerLine.show(text, color: ink.text) }
     }
 
     // Stored in CoreGraphics global coordinates (top-left origin of the main display).
@@ -308,14 +355,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func selectRegion() {
-        guard overlay == nil, let screen = NSScreen.screens.first else { return }
-        let window = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        if let overlay { // already open (invisible): just bring it back with the crosshair
+            overlay.orderFrontRegardless()
+            label.show(Config.picking)
+            return
+        }
+        guard let screen = NSScreen.screens.first else { return }
+        let window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                   backing: .buffered, defer: false)
         window.level = .screenSaver
         window.isOpaque = false
         window.backgroundColor = .clear
-        // The overlay needs key focus for the drag; hand it back to whatever was in front afterwards.
-        let previousApp = NSWorkspace.shared.frontmostApplication
-            .flatMap { $0 == NSRunningApplication.current ? nil : $0 }
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let size = screen.frame.size
         window.contentView = SelectionView(frame: NSRect(origin: .zero, size: size)) { [weak self] rect in
             if let rect {
@@ -324,12 +375,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self?.overlay?.orderOut(nil)
             self?.overlay = nil
-            previousApp?.activate()
+            self?.label.show("")
         }
         overlay = window
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(window.contentView)
+        window.orderFrontRegardless() // no activate, no key: focus stays where it was
+        // A background app may not change the cursor, so the corner dot is the "drag now" sign.
+        label.show(Config.picking)
     }
 }
 

@@ -23,9 +23,11 @@ ollama pull qwen3:30b-a3b-thinking-2507-q4_K_M
 
 ## Dùng
 
-- **Hỏi:** rê chuột lên chấm xám mờ ở góc trên phải (hoặc lên chữ đáp án đang hiện) và giữ yên khoảng 0,5 giây. Mỗi lần hỏi, app chỉ chụp màn hình một lần. Nếu trong vùng không thấy ít nhất 2 đáp án dạng `A.` / `B)` thì app trả `?` ngay, không chạy model.
-- **Chọn lại vùng:** rê chuột vào **góc trên cùng bên trái** màn hình và giữ yên 2 giây.
-- **Bấm vào chấm xám** để mở menu *Chọn lại vùng / Thoát*.
+- **Hỏi:** rê chuột lên chấm xám mờ ở góc trên phải và giữ yên khoảng 0,5 giây. Chấm luôn đứng yên ở góc. Mỗi lần hỏi, app chỉ chụp màn hình một lần. Nếu trong vùng không thấy ít nhất 2 đáp án dạng `A.` / `B)` mà cũng không có đề tự luận thì app trả `?` ngay.
+- **Đáp án hiện riêng, tách khỏi chấm**, mặc định nằm ngay bên trái chấm. **Kéo chữ đáp án** đi chỗ nào cũng được, app nhớ vị trí. Đáp án nằm yên tới khi anh hỏi câu mới. Chữ rất mờ, khoảng 20%, và tự chọn xám đậm hoặc xám nhạt theo màu nền bên dưới.
+- **Tự luận (Accounting Principles, US GAAP, giáo trình Wild):** nếu trong vùng không có đáp án A/B/C/D, app giải theo dạng tự luận, mất khoảng 1–3 phút. Lời giải hiện **từng dòng một**, mỗi dòng là một bút toán hoặc một phép tính, ví dụ `Dec 10  Dr A/R 28,000 · Cr Sale revenue 28,000   2/5`. **Lướt trên dòng chữ** để chuyển dòng, mỗi lần lướt đi một dòng. Lời giải chỉ để tham khảo khi ôn: model chạy trên máy vẫn có thể sai.
+- **Chọn lại vùng:** rê chuột vào **góc trên cùng bên trái** màn hình và giữ yên vài giây. Khi chấm xám ở góc phải đổi thành `+` thì kéo khung quanh câu hỏi. Màn hình không thay đổi gì và cửa sổ đang dùng vẫn giữ tiêu điểm. Bấm một cái mà không kéo để huỷ.
+- **Thoát:** dùng Activity Monitor (tìm *VincentNote* → ✕), hoặc ⌃⌥Q. App không có menu, để không thao tác nào có thể lấy tiêu điểm.
 - **Bấm đúp icon app** khi app đang chạy cũng mở màn hình chọn lại vùng.
 - Phím tắt, nếu bàn phím dùng được:
 
