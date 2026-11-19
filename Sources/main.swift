@@ -95,7 +95,11 @@ final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
+/// Nothing visible by request: no dimming, no outlines — just the crosshair cursor while dragging.
 final class SelectionView: NSView {
+    // Near-zero alpha: fully transparent pixels would let clicks fall through to the app below.
+    private static let catchAllFill = NSColor.black.withAlphaComponent(0.003)
+
     private var start: NSPoint?
     private var selection = NSRect.zero
     private let onDone: (NSRect?) -> Void
@@ -115,7 +119,6 @@ final class SelectionView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         selection = NSRect(x: min(start.x, point.x), y: min(start.y, point.y),
                            width: abs(point.x - start.x), height: abs(point.y - start.y))
-        needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {
         onDone(selection.width > 10 && selection.height > 10 ? selection : nil)
@@ -124,12 +127,8 @@ final class SelectionView: NSView {
         if event.keyCode == UInt16(kVK_Escape) { onDone(nil) }
     }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.withAlphaComponent(0.35).setFill()
+        Self.catchAllFill.setFill() // invisible; only the crosshair cursor shows
         bounds.fill()
-        NSColor.clear.setFill()
-        selection.fill(using: .copy)
-        NSColor.systemYellow.setStroke()
-        NSBezierPath(rect: selection).stroke()
     }
 }
 
@@ -314,13 +313,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.level = .screenSaver
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.contentView = SelectionView(frame: NSRect(origin: .zero, size: screen.frame.size)) { [weak self] rect in
+        // The overlay needs key focus for the drag; hand it back to whatever was in front afterwards.
+        let previousApp = NSWorkspace.shared.frontmostApplication
+            .flatMap { $0 == NSRunningApplication.current ? nil : $0 }
+        let size = screen.frame.size
+        window.contentView = SelectionView(frame: NSRect(origin: .zero, size: size)) { [weak self] rect in
             if let rect {
-                let cg = [rect.minX, screen.frame.height - rect.maxY, rect.width, rect.height].map(Double.init)
+                let cg = [rect.minX, size.height - rect.maxY, rect.width, rect.height].map(Double.init)
                 UserDefaults.standard.set(cg, forKey: Config.regionKey)
             }
             self?.overlay?.orderOut(nil)
             self?.overlay = nil
+            previousApp?.activate()
         }
         overlay = window
         NSApp.activate(ignoringOtherApps: true)
